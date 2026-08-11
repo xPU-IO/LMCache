@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # Standard
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional
 import os
@@ -25,7 +26,9 @@ from lmcache import torch_device_type
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2StoreResult
+from lmcache.v1.distributed.l1_manager import get_current_l1_manager
 from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
@@ -159,6 +162,7 @@ class _LoadPerf:
         "_batch_ok",
         "_n_batch_reqs",
         "_path_misses",
+        "_n_bp_timeouts",
     )
 
     def __init__(self, enabled: bool) -> None:
@@ -171,6 +175,7 @@ class _LoadPerf:
         self._batch_ok = 0
         self._n_batch_reqs = 0
         self._path_misses = 0
+        self._n_bp_timeouts = 0
 
     def mark(self) -> float:
         """Return a timestamp for later :meth:`measure`."""
@@ -197,6 +202,17 @@ class _LoadPerf:
     def add_fd_miss(self) -> None:
         if self.enabled:
             self._fd_misses += 1
+
+    def add_fd_stats(self, hits: int, misses: int) -> None:
+        """Batch add fd hit/miss counts (for parallel open path)."""
+        if self.enabled:
+            self._fd_hits += hits
+            self._fd_misses += misses
+
+    def add_bp_timeout(self) -> None:
+        """Record a backpressure timeout."""
+        if self.enabled:
+            self._n_bp_timeouts += 1
 
     def finish_early(self, task_id: int, n_keys: int) -> None:
         """Log for the early-return (no files found) path."""
@@ -226,11 +242,12 @@ class _LoadPerf:
         t_total = time.perf_counter() - self.t_start
         t_path = self._timings.get("path", 0.0)
         t_alloc = self._timings.get("alloc", 0.0)
+        t_bp = self._timings.get("backpressure", 0.0)
         t_fd = self._timings.get("fd", 0.0)
         t_read = self._timings.get("read_batch", 0.0)
         t_result = self._timings.get("result", 0.0)
         t_fb = self._timings.get("fallback", 0.0)
-        t_prep = t_alloc + t_fd
+        t_prep = t_bp + t_alloc + t_fd
         read_bw = (
             self._batch_bytes / t_read / 1024 / 1024
             if t_read > 0 and self._batch_bytes > 0
@@ -243,7 +260,9 @@ class _LoadPerf:
             f"hit_rate={hit_rate:.1f}% dev_objs={n_device_objs} "
             f"total={t_total * 1000:.1f}ms | "
             f"path={t_path * 1000:.1f}ms(miss={self._path_misses}) | "
-            f"prep={t_prep * 1000:.1f}ms[alloc={t_alloc * 1000:.1f}ms "
+            f"prep={t_prep * 1000:.1f}ms[bp={t_bp * 1000:.1f}ms"
+            f"(to={self._n_bp_timeouts}) "
+            f"alloc={t_alloc * 1000:.1f}ms "
             f"fd={t_fd * 1000:.1f}ms(hits={self._fd_hits} miss={self._fd_misses})] | "
             f"read={t_read * 1000:.1f}ms[{self._n_batch_reqs}reqs "
             f"{self._batch_bytes / 1024 / 1024:.1f}MB {read_bw:.0f}MB/s] | "
@@ -410,6 +429,17 @@ class PhxL2Adapter(L2AdapterInterface):
         self._lookup_efd = create_event_notifier()
         self._load_efd = create_event_notifier()
 
+        # L1Manager reference for self-admission: when PHX DMA produces
+        # device-resident objs, query_load_result replaces the pre-allocated
+        # CPU objs in L1 with them (mark_temporary=True) so retrieve serves
+        # via D2D and finish_read auto-recycles the DMA buffer.
+        self._l1_manager = get_current_l1_manager()
+        if self._l1_manager is None and self._phx_caches:
+            raise RuntimeError(
+                "PhxL2Adapter: L1Manager not yet constructed; "
+                "adapter must be created after StorageManager's L1Manager"
+            )
+
         # ── task queues ──
         self._store_queue: list[tuple[L2TaskId, list, list]] = []
         self._store_lock = threading.Lock()
@@ -430,8 +460,9 @@ class PhxL2Adapter(L2AdapterInterface):
         self._next_load_id = 0
         # Device-resident MemoryObjs produced by PHX DMA load (task_id ->
         # {key: obj}). Populated by _process_load when is_phx_available();
-        # consumed by pop_loaded_device_objs() so the prefetch controller can
-        # store them in L1 and serve retrieve via D2D (no D2H round-trip).
+        # consumed by query_load_result() which self-admits them into L1
+        # via replace_memory_obj(mark_temporary=True) so retrieve serves
+        # via D2D and finish_read auto-recycles the DMA buffer.
         self._load_device_objs: dict[L2TaskId, dict[ObjectKey, MemoryObj]] = {}
 
         # ── hot cache ──
@@ -444,10 +475,11 @@ class PhxL2Adapter(L2AdapterInterface):
         # store uses .tmp files which are temporary and not worth caching.
         self._fd_cache: OrderedDict[str, int] = OrderedDict()
         self._fd_cache_lock = threading.Lock()
-        # One fd per cache file (one chunk = 256 tokens). 4096 fds covers
-        # 4096 * 256 = 1M tokens of prompt, sufficient for agent workloads.
-        # A single process can typically hold ~10K file handles.
-        self._fd_cache_max = 4096
+        # One fd per cache file (one chunk = 256 tokens).  Sized to cover
+        # the full working set observed in production traces (~256K unique
+        # paths).  Each fd uses ~4 KB of kernel memory (~1 GB total) which
+        # is negligible on servers with 1M fd limit (ulimit -n).
+        self._fd_cache_max = 262144
 
         # ── background worker ──
         self._stop_flag = threading.Event()
@@ -571,8 +603,46 @@ class PhxL2Adapter(L2AdapterInterface):
         return task_id
 
     def query_load_result(self, task_id: L2TaskId) -> Optional[Bitmap]:
+        """Pop the load bitmap for *task_id* and self-admit device objs.
+
+        When PHX DMA was used, device-resident MemoryObjs were allocated
+        from the phx pool during ``_process_load``.  Here we replace the
+        pre-allocated CPU placeholder objs in L1 with these device objs,
+        marking them ``is_temporary=True`` so that ``finish_read``
+        automatically deletes the L1 entry and frees the device obj back
+        to the phx pool (via ``PhxL1MemoryManager.free`` dispatch) when
+        read locks reach zero — no manual ``release_device_objs`` needed.
+
+        Thread-safety: ``_load_results`` and ``_load_device_objs`` are
+        written under ``_load_results_lock`` in ``_process_load`` and
+        atomically popped here under the same lock, so the bitmap and
+        device objs are always consistent.
+
+        ``device_objs`` only contains keys whose DMA succeeded
+        (``_load_batch`` sets ``device_objs[key]`` and ``bitmap.set(idx)``
+        together; failed DMA objs are freed immediately and never enter
+        ``device_objs``).  POSIX-fallback keys fill the CPU obj directly
+        and are not in ``device_objs``.
+        """
         with self._load_results_lock:
-            return self._load_results.pop(task_id, None)
+            bitmap = self._load_results.pop(task_id, None)
+            if bitmap is None:
+                return None
+            device_objs = self._load_device_objs.pop(task_id, {})
+
+        # Self-admission: swap CPU placeholders for device-resident objs.
+        if device_objs and self._l1_manager is not None:
+            for key, obj in device_objs.items():
+                err = self._l1_manager.replace_memory_obj(key, obj, mark_temporary=True)
+                if err != L1Error.SUCCESS:
+                    # Entry was deleted (e.g. request aborted between
+                    # reserve_write and query_load_result).  Free the
+                    # device obj directly to avoid leaking pool memory.
+                    parent = obj.parent()
+                    if parent is not None:
+                        parent.free(obj)
+
+        return bitmap
 
     # ── background worker ──
 
@@ -914,6 +984,91 @@ class PhxL2Adapter(L2AdapterInterface):
         if fd is not None:
             os.close(fd)
 
+    def _batch_open_fds(self, paths: list[str], flags: int) -> dict[str, int]:
+        """Open fds for multiple paths in parallel.
+
+        Returns a dict mapping path -> fd (or -1 if open failed).
+        Uses a thread pool to parallelize os.open syscalls, which are
+        I/O-bound (especially with O_DIRECT) and release the GIL.
+        """
+        if not paths:
+            return {}
+        results: dict[str, int] = {}
+
+        def _open_one(p: str) -> tuple[str, int]:
+            try:
+                return p, os.open(p, flags)
+            except OSError:
+                return p, -1
+
+        # Small batches: serial is faster (no thread pool overhead)
+        if len(paths) <= 4:
+            for p in paths:
+                try:
+                    results[p] = os.open(p, flags)
+                except OSError:
+                    results[p] = -1
+            return results
+
+        n_workers = min(32, len(paths))
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for p, fd in pool.map(_open_one, paths):
+                results[p] = fd
+        return results
+
+    def _batch_get_read_fds(
+        self, paths: list[str], flags: int, perf: _LoadPerf
+    ) -> dict[str, int]:
+        """Batch get fds: parallel-open cache misses, reuse cache hits.
+
+        1. Check which paths are already in the fd cache (hits).
+        2. Parallel os.open all unique misses.
+        3. Insert opened fds into the cache.
+        4. Return path -> fd mapping for all requested paths.
+
+        Records hit/miss counts into *perf*.
+        """
+        # Phase 1: classify hits vs misses
+        hit_paths: list[str] = []
+        miss_paths: list[str] = []
+        miss_set: set[str] = set()
+        for p in paths:
+            with self._fd_cache_lock:
+                cached = p in self._fd_cache
+            if cached:
+                hit_paths.append(p)
+            elif p not in miss_set:
+                miss_set.add(p)
+                miss_paths.append(p)
+
+        perf.add_fd_stats(len(hit_paths), len(miss_paths))
+
+        # Phase 2: parallel open misses
+        if miss_paths:
+            opened = self._batch_open_fds(miss_paths, flags)
+            with self._fd_cache_lock:
+                for p, fd in opened.items():
+                    if fd < 0:
+                        continue
+                    if p in self._fd_cache:
+                        # Another thread cached it; close duplicate
+                        os.close(fd)
+                        continue
+                    if len(self._fd_cache) >= self._fd_cache_max:
+                        _, old_fd = self._fd_cache.popitem(last=False)
+                        os.close(old_fd)
+                    self._fd_cache[p] = fd
+
+        # Phase 3: collect fds (all should be cache hits now)
+        result: dict[str, int] = {}
+        for p in paths:
+            try:
+                fd = self._get_read_fd(p, flags)  # moves to end (LRU update)
+                result[p] = fd
+            except OSError:
+                result[p] = -1
+        return result
+
     def _load_dma(self, path: str, tensor: Any, size: int) -> None:
         """Load via phxfs_read DMA to device buffer.
 
@@ -992,7 +1147,7 @@ class PhxL2Adapter(L2AdapterInterface):
             allocator = self._phx_allocators.get(dev_id)
             base_ptr = self._phx_base_pointers.get(dev_id)
             cache = self._phx_caches.get(dev_id)
-            if allocator is None or cache is None:
+            if allocator is None or cache is None or base_ptr is None:
                 # Device not initialized, skip (will go to fallback)
                 continue
 
@@ -1001,6 +1156,9 @@ class PhxL2Adapter(L2AdapterInterface):
             dev_batch_dev_objs: list[MemoryObj] = []
             dev_batch_paths: list[str] = []
 
+            # ── Phase 1: Backpressure + Alloc (serial) ──
+            t_alloc_start = perf.mark()
+            alloc_results: list[tuple[int, str, int, MemoryObj]] = []
             for i, path in group:
                 obj = objects[i]
                 cpu_tensor = obj.raw_tensor
@@ -1008,44 +1166,79 @@ class PhxL2Adapter(L2AdapterInterface):
                     continue
                 size = cpu_tensor.nbytes
 
-                # Allocate device MemoryObj on this device
-                t_a = perf.mark()
+                # Backpressure: wait for pool space before allocating.
+                # This avoids fallback to slow POSIX reads when the DMA
+                # buffer is temporarily full (device objs pending release
+                # by the retrieve path).
+                if hasattr(allocator, "wait_for_available"):
+                    t_bp = perf.mark()
+                    got = allocator.wait_for_available(size, timeout=5.0)
+                    perf.measure("backpressure", t_bp)
+                    if not got:
+                        perf.add_bp_timeout()
+                        logger.warning(
+                            "PhxL2: backpressure timeout on dev %d "
+                            "(need %d bytes, free %d, key %s)",
+                            dev_id,
+                            size,
+                            allocator.get_free_bytes()
+                            if hasattr(allocator, "get_free_bytes")
+                            else -1,
+                            keys[i],
+                        )
+                        continue  # timeout – fall back to POSIX
+
                 device_obj = allocator.allocate(
                     shapes=obj.metadata.shape,
                     dtypes=obj.metadata.dtype,
                     fmt=obj.metadata.fmt,
                 )
-                perf.measure("alloc", t_a)
                 if device_obj is None:
                     logger.warning(
                         "PhxL2: pool exhausted on dev %d (key %s)", dev_id, keys[i]
                     )
                     continue  # pool exhausted, skip for fallback
 
-                # Open fd
-                with self._fd_cache_lock:
-                    was_cached = path in self._fd_cache
-                t_f = perf.mark()
-                try:
-                    fd = self._get_read_fd(path, flags)
-                except OSError as e:
-                    allocator.free(device_obj)
-                    logger.error("PhxL2Adapter open failed for %s: %s", keys[i], e)
-                    continue
-                perf.measure("fd", t_f)
-                if was_cached:
-                    perf.add_fd_hit()
-                else:
-                    perf.add_fd_miss()
+                alloc_results.append((i, path, size, device_obj))
+            perf.measure("alloc", t_alloc_start)
 
-                buf_offset = device_obj.raw_tensor.data_ptr() - base_ptr
+            # ── Phase 2: Batch open fds (parallel for cache misses) ──
+            t_fd_start = perf.mark()
+            if alloc_results:
+                unique_paths = []
+                seen_paths: set[str] = set()
+                for _, path, _, _ in alloc_results:
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        unique_paths.append(path)
+                fd_map = self._batch_get_read_fds(unique_paths, flags, perf)
+            else:
+                fd_map = {}
+            perf.measure("fd", t_fd_start)
+
+            # ── Phase 3: Assemble batch requests ──
+            for i, path, size, device_obj in alloc_results:
+                fd = fd_map.get(path, -1)
+                if fd < 0:
+                    allocator.free(device_obj)
+                    logger.error("PhxL2Adapter open failed for %s", keys[i])
+                    continue
+
+                dev_tensor = device_obj.raw_tensor
+                if dev_tensor is None:
+                    allocator.free(device_obj)
+                    logger.error(
+                        "PhxL2Adapter device obj has no tensor for %s", keys[i]
+                    )
+                    continue
+                buf_offset = dev_tensor.data_ptr() - base_ptr
                 dev_batch_indices.append(i)
                 dev_batch_reqs.append((fd, buf_offset, size, 0))
                 dev_batch_dev_objs.append(device_obj)
                 dev_batch_paths.append(path)
                 batch_bytes += size
 
-            # Batch read on this device
+            # ── Phase 4: Batch read on this device ──
             if dev_batch_reqs:
                 t_read_start = perf.mark()
                 try:
@@ -1119,21 +1312,6 @@ class PhxL2Adapter(L2AdapterInterface):
         CUDA_VISIBLE_DEVICES index.
         """
         return (kv_rank >> 16) & 0xFF
-
-    def pop_loaded_device_objs(self, task_id: L2TaskId) -> dict[ObjectKey, MemoryObj]:
-        """Return device-resident MemoryObjs produced by this load task.
-
-        Overrides the base no-op: when PHX DMA was used, returns the device
-        MemoryObjs allocated from the phx pool (keyed by ObjectKey) so the
-        prefetch controller can store them in L1 and serve retrieve via
-        device→device scatter (D2D) instead of an H2D copy.
-
-        Returns an empty dict for keys that fell back to POSIX read (those
-        filled the controller-provided CPU obj directly) or for tasks that
-        have already been popped.
-        """
-        with self._load_results_lock:
-            return self._load_device_objs.pop(task_id, {})
 
     # ── lifecycle ──
 
